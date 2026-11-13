@@ -1,0 +1,15 @@
+.gradle/
+.tooling/
+**/build/
+local.properties
+*.keystore
+*.jks
+.idea/
+output/
+artifacts/node_modules/
+.env
+.env.*
+!*.example
+*service-account*.json
+*service_account*.json
+*credentials*.json

@@ -6,6 +6,7 @@ local.properties
 *.jks
 .idea/
 output/
+*.inspect.ndjson
 artifacts/node_modules/
 .env
 .env.*

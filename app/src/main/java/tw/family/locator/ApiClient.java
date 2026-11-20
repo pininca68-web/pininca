@@ -68,6 +68,11 @@ public final class ApiClient {
                 archivedIdentities = Collections.emptySet();
                 try { secrets.write("session", null); } catch (Exception ignored) {}
             }
+            if (prefs.getInt("manual_privacy_version", 0) < 1) {
+                // An upgrade never carries automatic-location consent into manual reporting.
+                prefs.edit().putInt("manual_privacy_version", 1).putBoolean("local_sharing", false)
+                        .putBoolean("stop_requested", session != null).apply();
+            }
             initialized = true;
         }
     }
@@ -161,7 +166,7 @@ public final class ApiClient {
                 saveSession(null);
                 prefs.edit().putBoolean("local_sharing", false).putBoolean("stop_requested", false).apply();
             }
-            if (failure != null || archivedRevoke) LocationSharingService.scheduleRevocation(context);
+            if (failure != null || archivedRevoke) LocationRevocation.schedule(context);
         }
     }
 
@@ -220,6 +225,7 @@ public final class ApiClient {
         long intentVersion = CONSENT_VERSION.incrementAndGet();
         synchronized (LOCK) {
             flushPendingStopLocked();
+            requireManualPrivacy();
             authenticated("/rest/v1/rpc/set_sharing", json("p_enabled", true));
             if (CONSENT_VERSION.get() != intentVersion) {
                 prefs.edit().putBoolean("stop_requested", true).putBoolean("local_sharing", false).apply();
@@ -230,8 +236,31 @@ public final class ApiClient {
         }
     }
 
+    /** Call before acquiring a fix. Legacy backends must never receive a new location. */
+    public void requireManualPrivacy() throws ApiException {
+        JSONObject status;
+        try { status = object(rpc("location_privacy_status", new JSONObject())); }
+        catch (ApiException error) {
+            throw new ApiException("雲端尚未確認手動回報版本。請先套用 003_manual_location_privacy.sql，再回報位置。", error.status);
+        }
+        if (status.optInt("privacy_version", 0) < 1 || !status.optBoolean("manual_only", false)
+                || !Boolean.FALSE.equals(status.opt("location_history_export")))
+            throw new ApiException("雲端尚未停用位置歷史匯出，本次不會取得或傳送位置。請先更新雲端資料庫。");
+    }
+
+    public JSONObject deleteMyLocationData() throws ApiException {
+        requestLocalStop(context);
+        synchronized (LOCK) {
+            flushPendingStopLocked();
+            requireManualPrivacy();
+            return object(authenticated("/rest/v1/rpc/delete_my_location_data", new JSONObject()));
+        }
+    }
+
     public void publishLocation(double latitude, double longitude, float accuracy,
-                                int batteryLevel, String recordedAt) throws ApiException {
+                                int batteryLevel, String recordedAt, String expectedFamilyId) throws ApiException {
+        if (expectedFamilyId == null || expectedFamilyId.isEmpty())
+            throw new ApiException("請先加入家庭後再回報位置。");
         long timestamp;
         try { timestamp = Instant.parse(recordedAt).toEpochMilli(); }
         catch (Exception exception) { throw new ApiException("定位時間無效，請重新取得位置。"); }
@@ -242,25 +271,14 @@ public final class ApiClient {
             flushArchivedRevokeLocked(false);
             // A stop marker is written without LOCK so it also cancels queued uploads.
             if (prefs.getBoolean("stop_requested", false)) throw new ApiException("位置分享已停止。");
-            authenticated("/rest/v1/rpc/publish_location", json("p_lat", latitude, "p_lng", longitude,
+            JSONObject saved = object(authenticated("/rest/v1/rpc/publish_manual_location", json("p_lat", latitude, "p_lng", longitude,
                     "p_accuracy", accuracy, "p_battery", batteryLevel < 0 ? JSONObject.NULL : Math.min(100, batteryLevel),
-                    "p_recorded_at", recordedAt));
-            // Recorded inside the upload lock, before another automatic/manual upload can start.
+                    "p_recorded_at", recordedAt, "p_expected_family_id", expectedFamilyId)));
+            if (!Boolean.TRUE.equals(saved.opt("stored")))
+                throw new ApiException("伺服器保留了較新的位置，本次回報未更新。請重新整理後再試。");
+            // Serialize a confirmed manual upload with withdrawal and deletion.
             prefs.edit().putString("last_upload_identity", getServerUrl() + "\n" + currentUserId())
                     .putLong("last_upload_at", System.currentTimeMillis()).apply();
-        }
-    }
-
-    /** Automatic mode also respects a manual report that finished a moment ago. */
-    public boolean publishLocationIfDue(double latitude, double longitude, float accuracy,
-                                       int batteryLevel, String recordedAt, int intervalMinutes) throws ApiException {
-        synchronized (LOCK) {
-            long last = CheckInPreferences.getLastReportedAt(context);
-            if ((getServerUrl() + "\n" + currentUserId()).equals(prefs.getString("last_upload_identity", "")))
-                last = Math.max(last, prefs.getLong("last_upload_at", 0));
-            if (!LocationPolicy.isDue(last, System.currentTimeMillis(), intervalMinutes)) return false;
-            publishLocation(latitude, longitude, accuracy, batteryLevel, recordedAt);
-            return true;
         }
     }
 
@@ -317,7 +335,7 @@ public final class ApiClient {
     private void reconcileAfterLoginLocked() {
         try { flushArchivedRevokeLocked(false); }
         catch (ApiException ignored) { /* Keep the task; login remains recoverable and can retry. */ }
-        if (archivedRevoke) LocationSharingService.scheduleRevocation(context);
+        if (archivedRevoke) LocationRevocation.schedule(context);
     }
 
     private static JSONArray readRevocationsLocked() throws ApiException {

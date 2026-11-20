@@ -17,6 +17,7 @@ public final class CheckInScheduler {
     public static final String ACTION_REPORT_NOW = "tw.family.locator.REPORT_NOW";
     public static final String ACTION_REMINDER_DUE = "tw.family.locator.REMINDER_DUE";
     public static final String ACTION_REPORT_COMPLETED = "tw.family.locator.REPORT_COMPLETED";
+    public static final String ACTION_REMINDER_SETTINGS_CHANGED = "tw.family.locator.REMINDER_SETTINGS_CHANGED";
     public static final String EXTRA_REASON = "reason";
     static final String ACTION_ALARM = "tw.family.locator.CHECK_IN_ALARM";
     static final String ACTION_SNOOZE = "tw.family.locator.CHECK_IN_SNOOZE";
@@ -44,7 +45,7 @@ public final class CheckInScheduler {
                 CheckInPreferences.setNextReminderAt(app, 0);
             } else {
                 long next = CheckInPreferences.ensureCycle(app, System.currentTimeMillis());
-                // Both alarm delivery and the existing service claim this same deadline.
+                // An inexact alarm only delivers a prompt for the user to open the App.
                 alarms.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, next, alarmIntent(app));
             }
             if (!CheckInPreferences.isEnabled(app)) {
@@ -54,9 +55,13 @@ public final class CheckInScheduler {
                 return;
             }
             long now = System.currentTimeMillis();
+            if (!isReminderDay(app)) dismissNotification(app);
             long snooze = CheckInPreferences.getSnoozeDue(app);
             if (snooze > 0) {
                 long bounded = Math.min(snooze, ReminderTiming.add(now, ReminderTiming.SNOOZE_MS));
+                // A stored or overdue snooze must never wake on an excluded Taipei date.
+                bounded = ReportWeekdays.nextAllowedAt(Math.max(now, bounded),
+                        CheckInPreferences.getReportDaysMask(app));
                 CheckInPreferences.setSnoozeDue(app, bounded);
                 alarms.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, bounded, snoozeAlarmIntent(app));
             } else alarms.cancel(snoozeAlarmIntent(app));
@@ -76,7 +81,8 @@ public final class CheckInScheduler {
         synchronized (CheckInPreferences.LOCK) {
             if (!CheckInPreferences.isEnabled(context)) return;
             CheckInPreferences.setSnoozeDue(context,
-                    ReminderTiming.add(System.currentTimeMillis(), ReminderTiming.SNOOZE_MS));
+                    ReportWeekdays.snoozeDue(System.currentTimeMillis(),
+                            CheckInPreferences.getReportDaysMask(context)));
             dismissNotification(context);
             reschedule(context);
         }
@@ -95,8 +101,6 @@ public final class CheckInScheduler {
                 return;
             }
         }
-        // This only posts to a live instance. It never starts/binds a service from a receiver.
-        if (LocationSharingService.checkNow()) return;
         ReportCyclePolicy.Window window = CheckInPreferences.claimDueWindow(context, now);
         if (window != null) notifyReportNeeded(context, "到回報時間了，請手動回報位置，讓家人安心。");
         reschedule(context);
@@ -107,15 +111,24 @@ public final class CheckInScheduler {
         dispatchReminder(context.getApplicationContext(), true, "這是回報提醒預覽。");
     }
 
+    public static boolean isReminderDay(Context context) {
+        return ReportWeekdays.isSelectedDay(System.currentTimeMillis(),
+                CheckInPreferences.getReportDaysMask(context));
+    }
+
     /** Does not move the cycle deadline or mark a location as reported. */
     public static void notifyReportNeeded(Context context, String reason) {
         synchronized (CheckInPreferences.LOCK) {
-            if (!CheckInPreferences.isEnabled(context)) return;
+            if (!CheckInPreferences.isEnabled(context) || !isReminderDay(context)) return;
             dispatchReminder(context.getApplicationContext(), false, reason);
         }
     }
 
     private static void dispatchReminder(Context context, boolean preview, String reason) {
+        if (!isReminderDay(context)) {
+            dismissNotification(context);
+            return;
+        }
         context.sendBroadcast(new Intent(ACTION_REMINDER_DUE).setPackage(context.getPackageName())
                 .putExtra("preview", preview).putExtra(EXTRA_REASON, reason));
         if (!appForeground) postNotification(context, reason);
@@ -145,6 +158,7 @@ public final class CheckInScheduler {
         PendingIntent pause = PendingIntent.getBroadcast(context, 7505,
                 new Intent(context, CheckInReceiver.class).setAction(ACTION_PAUSE),
                 PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+        long shownAt = System.currentTimeMillis();
         Notification notification = new Notification.Builder(context, CHANNEL_ID)
                 .setSmallIcon(R.drawable.ic_notification)
                 .setContentTitle("家人位置回報提醒")
@@ -156,6 +170,7 @@ public final class CheckInScheduler {
                 .setVisibility(Notification.VISIBILITY_PRIVATE)
                 .setAutoCancel(true)
                 .setOnlyAlertOnce(false)
+                .setTimeoutAfter(ReportWeekdays.nextMidnightAt(shownAt) - shownAt)
                 .addAction(new Notification.Action.Builder(null, "立即回報", open).build())
                 .addAction(new Notification.Action.Builder(null, "稍後 10 分鐘", later).build())
                 .addAction(new Notification.Action.Builder(null, "暫停提醒", pause).build())

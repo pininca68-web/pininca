@@ -25,6 +25,7 @@ import android.view.View;
 import android.view.ViewGroup;
 import android.view.WindowInsets;
 import android.widget.Button;
+import android.widget.CheckBox;
 import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
@@ -69,8 +70,6 @@ public final class MainActivity extends Activity {
     private static final int SOFT = Color.rgb(232, 237, 226);
     private static final int BORDER = Color.rgb(216, 222, 210);
     private static final int AMBER = Color.rgb(148, 91, 21);
-    private static final int LOCATION_PERMISSION = 41;
-    private static final int NOTIFICATION_PERMISSION = 42;
     private static final int REPORT_LOCATION_PERMISSION = 43;
     private static final int REMINDER_NOTIFICATION_PERMISSION = 44;
     private static final int LOCATION_SETTINGS_REQUEST = 45;
@@ -90,7 +89,6 @@ public final class MainActivity extends Activity {
     private TextView mapHint;
     private LinearLayout memberList;
     private LinearLayout sharingCard;
-    private Switch sharingSwitch;
     private MapView mapView;
     private MapLibreMap map;
     private Bundle mapSavedState;
@@ -100,7 +98,6 @@ public final class MainActivity extends Activity {
     private volatile boolean destroyed;
     private boolean busy;
     private boolean refreshing;
-    private boolean pendingSharePermission;
     private boolean stopNeedsSync;
     private boolean mapNeedsFit = true;
     private int sessionEpoch;
@@ -114,11 +111,10 @@ public final class MainActivity extends Activity {
     private FrameLayout reminderBanner;
     private OneShotLocation.Cancellation manualLocation;
     private volatile int manualReportEpoch;
-    private boolean startShareAfterResume;
     private boolean manualReportAfterResume;
     private boolean settingsSyncing;
     private boolean resumeSingleReportAfterSettings;
-    private boolean resumeAutoAfterSettings;
+    private final Runnable expireReminderBanner = this::dismissReminderBanner;
 
     private final BroadcastReceiver reminderReceiver = new BroadcastReceiver() {
         @Override public void onReceive(Context context, Intent intent) {
@@ -127,6 +123,9 @@ public final class MainActivity extends Activity {
             else if (CheckInScheduler.ACTION_REPORT_COMPLETED.equals(intent.getAction())) {
                 dismissReminderBanner();
                 refreshFamily(false);
+            } else if (CheckInScheduler.ACTION_REMINDER_SETTINGS_CHANGED.equals(intent.getAction())) {
+                dismissReminderBanner();
+                renderSharingCard();
             }
         }
     };
@@ -142,6 +141,7 @@ public final class MainActivity extends Activity {
     @Override public void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         api = new ApiClient(getApplicationContext());
+        if (api.hasPendingStop()) LocationRevocation.stop(this);
         MapLibre.getInstance(this);
         mapSavedState = savedInstanceState == null ? null : savedInstanceState.getBundle("map_state");
         getWindow().setStatusBarColor(CREAM);
@@ -179,7 +179,6 @@ public final class MainActivity extends Activity {
         actionViews.clear();
         memberList = null;
         sharingCard = null;
-        sharingSwitch = null;
         mapHint = null;
         connectionText = null;
         LinearLayout shell = column();
@@ -365,44 +364,22 @@ public final class MainActivity extends Activity {
         if (sharingCard == null) return;
         discardActions(sharingCard);
         sharingCard.removeAllViews();
-        LinearLayout line = row();
-        line.addView(text("分享我的位置", 18, GREEN, true), new LinearLayout.LayoutParams(0, -2, 1));
-        sharingSwitch = new Switch(this);
-        sharingSwitch.setContentDescription("分享我的位置");
-        sharingSwitch.setThumbTintList(new ColorStateList(new int[][]{{android.R.attr.state_checked}, {}},
-                new int[]{GREEN, MUTED}));
-        boolean running = LocationSharingService.isRunning();
-        sharingSwitch.setChecked(running && !stopNeedsSync);
-        sharingSwitch.setEnabled(!busy);
-        actionViews.add(sharingSwitch);
-        sharingSwitch.setOnCheckedChangeListener((view, checked) -> {
-            if (busy) return;
-            if (checked) {
-                // A tap expresses intent; the switch becomes on only after permission and start succeed.
-                sharingSwitch.setOnCheckedChangeListener(null);
-                sharingSwitch.setChecked(false);
-                renderSharingCard();
-                confirmStartSharing();
-            } else stopSharing();
-        });
-        line.addView(sharingSwitch, new LinearLayout.LayoutParams(-2, dp(48)));
-        sharingCard.addView(line);
+        sharingCard.addView(text("由我決定何時回報", 18, GREEN, true));
         boolean serverSharing = selfMember() != null && selfMember().optBoolean("sharing", false);
         String revokeNotice = api.getPendingRevocationNotice();
         if (!revokeNotice.isEmpty()) addParagraph(sharingCard, revokeNotice, 12);
         if (stopNeedsSync) {
             addParagraph(sharingCard, "本機已停止定位。雲端撤回尚未完成，其他家人仍可能看到上次的位置；恢復連線後會重試。", 13);
             addButton(sharingCard, "重試停止雲端分享", false, this::stopSharing);
-        } else if (running) {
-            addParagraph(sharingCard, "已開啟自動回報：每 " + intervalLabel(CheckInPreferences.getIntervalMinutes(this))
-                    + " 檢查近期是否使用 LINE、IG 或 FB，符合條件才嘗試更新位置。手機會顯示常駐通知，可隨時停止。", 13);
         } else if (serverSharing) {
-            addParagraph(sharingCard, "目前保留最後一次回報的位置，沒有自動更新。你可以立即回報、開啟自動回報，或停止雲端分享。", 13);
+            addParagraph(sharingCard, "家人可查看你最後一次手動回報的位置。每次更新都需要你按下回報；雲端只保留最新位置。", 13);
             addButton(sharingCard, "停止雲端分享", false, this::stopSharing);
         } else {
-            addParagraph(sharingCard, "目前未分享位置。可選擇單次回報，或開啟符合使用條件才更新的自動回報。", 13);
+            addParagraph(sharingCard, "目前未分享位置。按「立即回報我的位置」並確認後，才會取得一次目前位置。", 13);
         }
-        if (running) addParagraph(sharingCard, LocationSharingService.getStatus(), 12);
+        addParagraph(sharingCard, "提醒日：" + CheckInPreferences.getReportDaysLabel(this)
+                + " · " + (CheckInPreferences.isEnabled(this) ? intervalLabel(CheckInPreferences.getIntervalMinutes(this)) : "提醒關閉"), 12);
+        addButton(sharingCard, "刪除我的位置資料", false, this::confirmDeleteLocationData);
         if (manualLocation != null) {
             Button cancel = new Button(this);
             cancel.setText("取消這次回報");
@@ -575,83 +552,44 @@ public final class MainActivity extends Activity {
         if (map != null) map.clear();
     }
 
-    private void confirmStartSharing() {
-        if (busy) return;
-        new AlertDialog.Builder(this).setTitle("開始分享我的位置")
-                .setMessage("開啟後，每 " + intervalLabel(CheckInPreferences.getIntervalMinutes(this))
-                        + " 檢查最近是否使用 LINE、IG 或 FB，任一符合就嘗試回報一次，沒有使用則提醒手動回報。需開啟手機定位及「使用情況存取權」，並顯示常駐通知。同一家庭可查看最後回報的位置。回報會同步到家庭試算表並保留歷史；你隨時可以停止新回報。")
-                .setNegativeButton("先不要", (dialog, which) -> renderSharingCard())
-                .setPositiveButton("同意並開始", (dialog, which) -> {
-                    if (hasLocationPermission()) startSharing();
-                    else {
-                        pendingSharePermission = true;
-                        requestPermissions(new String[]{Manifest.permission.ACCESS_COARSE_LOCATION,
-                                Manifest.permission.ACCESS_FINE_LOCATION}, LOCATION_PERMISSION);
-                    }
-                }).show();
-    }
-
     private boolean hasLocationPermission() {
         return checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
                 || checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED;
     }
 
-    private void startSharing() {
-        if (!resumed || busy || !hasLocationPermission()) {
-            toast("請保持 App 開啟，並允許定位後再開始分享。");
-            return;
-        }
-        if (!LocationSharingService.isLocationEnabled(this)) {
-            showLocationSettings(true);
-            return;
-        }
-        if (!AppUsageGate.hasPermission(this)) {
-            new AlertDialog.Builder(this).setTitle("允許判斷 App 使用情況")
-                    .setMessage("自動回報需要你在系統設定允許「使用情況存取權」，以判斷近期是否用過指定 App。使用情況只在這支手機判斷。設定完成後，回到這裡重新開啟自動回報。")
-                    .setNegativeButton("取消", null)
-                    .setPositiveButton("前往設定", (dialog, which) -> startActivity(
-                            new Intent(android.provider.Settings.ACTION_USAGE_ACCESS_SETTINGS))).show();
-            return;
-        }
-        runTask("正在開啟位置分享…", () -> { api.setSharing(true); return true; }, ignored -> {
-            if (!resumed || !hasLocationPermission()) {
-                rollbackStart("分享尚未啟動。請回到 App 並確認定位權限後重試。");
-                return;
-            }
-            try {
-                LocationSharingService.start(this);
-                CheckInPreferences.setEnabled(this, true);
-                syncSettingsIfNeeded();
-                stopNeedsSync = false;
-                renderSharingCard();
-                renderMembers();
-                refreshFamily(true);
-                if (Build.VERSION.SDK_INT >= 33
-                        && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
-                    requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, NOTIFICATION_PERMISSION);
-                }
-            } catch (RuntimeException error) {
-                rollbackStart("手機無法啟動自動回報，已停止本機定位並嘗試撤回雲端分享。請確認定位權限後重試。");
-            }
-        });
+    private boolean isLocationEnabled() {
+        android.location.LocationManager manager = (android.location.LocationManager) getSystemService(LOCATION_SERVICE);
+        return manager != null && androidx.core.location.LocationManagerCompat.isLocationEnabled(manager);
     }
 
-    private void rollbackStart(String message) {
-        LocationSharingService.stop(this);
-        stopNeedsSync = true;
-        renderSharingCard();
-        runTask("正在撤回分享…", () -> { api.setSharing(false); return true; }, ignored -> {
-            stopNeedsSync = false;
-            toast(message);
-            refreshFamily(true);
-            renderSharingCard();
-        });
+    private void confirmDeleteLocationData() {
+        if (busy) return;
+        new AlertDialog.Builder(this).setTitle("刪除我的位置資料？")
+                .setMessage("將停止分享，並刪除雲端內屬於你的最新位置及位置歷史佇列，其他家人的資料不受影響。舊版已匯出的 Google 試算表位置列，仍需由試算表擁有者手動刪除。")
+                .setNegativeButton("取消", null)
+                .setPositiveButton("停止並刪除", (dialog, which) -> {
+                    cancelManualLocation();
+                    LocationRevocation.stop(this);
+                    stopNeedsSync = true;
+                    clearMap();
+                    renderSharingCard();
+                    runTask("正在停止分享並刪除我的位置資料…", api::deleteMyLocationData, result -> {
+                        stopNeedsSync = false;
+                        latestStatus = null;
+                        clearMap();
+                        renderScreen();
+                        refreshFamily(true);
+                        new AlertDialog.Builder(this).setTitle("雲端位置資料已刪除")
+                                .setMessage("已停止分享，雲端內屬於你的最新位置及位置歷史佇列已清除。\n\n舊版已匯出的 Google 試算表位置列，請由試算表擁有者手動刪除。")
+                                .setPositiveButton("知道了", null).show();
+                    });
+                }).show();
     }
 
     private void stopSharing() {
         if (busy) return;
         cancelManualLocation();
-        LocationSharingService.stop(this);
+        LocationRevocation.stop(this);
         stopNeedsSync = true;
         renderSharingCard();
         renderMembers();
@@ -666,23 +604,7 @@ public final class MainActivity extends Activity {
 
     @Override public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
-        if (requestCode == LOCATION_PERMISSION) {
-            boolean requested = pendingSharePermission;
-            pendingSharePermission = false;
-            if (requested && hasLocationPermission()) {
-                if (resumed) startSharing(); else startShareAfterResume = true;
-            }
-            else {
-                renderSharingCard();
-                toast("未取得定位權限，尚未開始分享。你仍可查看其他家人的分享位置。");
-            }
-        } else if (requestCode == NOTIFICATION_PERMISSION) {
-            // Notification permission affects the notification drawer, never location consent.
-            if (Build.VERSION.SDK_INT >= 33
-                    && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
-                toast("未允許通知；自動回報仍可用，但手機無法彈出回報提醒。可在 App 設定開啟通知。");
-            }
-        } else if (requestCode == REPORT_LOCATION_PERMISSION) {
+        if (requestCode == REPORT_LOCATION_PERMISSION) {
             boolean requested = pendingManualReport;
             pendingManualReport = false;
             if (requested && hasLocationPermission()) {
@@ -748,7 +670,7 @@ public final class MainActivity extends Activity {
                 .setPositiveButton("停止分享並離開", (dialog, which) -> {
                     cancelManualLocation();
                     CalendarScheduler.clearForAccountChange(this);
-                    LocationSharingService.stop(this);
+                    LocationRevocation.stop(this);
                     stopNeedsSync = true;
                     renderSharingCard();
                     runTask("正在停止分享並離開家庭…", () -> {
@@ -811,8 +733,8 @@ public final class MainActivity extends Activity {
             new AlertDialog.Builder(this).setTitle("家庭 Google 試算表")
                     .setMessage(connection + "\n\n等待同步（含重試）：" + status.optInt("queued", 0)
                             + " 筆\n待重試：" + status.optInt("failed", 0)
-                            + " 筆\n\n會記錄定位回報、家庭成員、行事曆與回報設定。需完成家庭後端及 Google 寫入連線。"
-                            + "\n\n停止分享會撤回地圖位置，已匯入試算表的歷史紀錄仍保留。")
+                            + " 筆\n\n新版僅同步家庭成員、行事曆與回報設定，不再寫入位置。需完成家庭後端及 Google 寫入連線。"
+                            + "\n\n舊版已匯出的位置列，請由試算表擁有者手動刪除。")
                     .setPositiveButton("知道了", null).show();
         });
     }
@@ -837,6 +759,30 @@ public final class MainActivity extends Activity {
         enabled.setTextColor(INK);
         enabled.setChecked(CheckInPreferences.isEnabled(this));
         form.addView(enabled, new LinearLayout.LayoutParams(-1, dp(52)));
+        addParagraph(form, "選擇提醒日（台北時間）", 16);
+        CheckBox[] days = new CheckBox[7];
+        String[] dayNames = {"週一", "週二", "週三", "週四", "週五", "週六", "週日"};
+        int savedMask = CheckInPreferences.getReportDaysMask(this);
+        for (int i = 0; i < days.length; i++) {
+            days[i] = new CheckBox(this);
+            days[i].setText(dayNames[i]);
+            days[i].setChecked((savedMask & (1 << i)) != 0);
+        }
+        LinearLayout presets = row();
+        String[] presetNames = {"每天", "平日", "週末"};
+        int[] masks = {ReportWeekdays.ALL, ReportWeekdays.WEEKDAYS, ReportWeekdays.WEEKENDS};
+        for (int i = 0; i < masks.length; i++) {
+            final int mask = masks[i];
+            Button preset = new Button(this);
+            preset.setText(presetNames[i]);
+            preset.setOnClickListener(view -> {
+                for (int d = 0; d < days.length; d++) days[d].setChecked((mask & (1 << d)) != 0);
+            });
+            presets.addView(preset, new LinearLayout.LayoutParams(0, dp(48), 1));
+        }
+        form.addView(presets);
+        for (CheckBox day : days) form.addView(day, new LinearLayout.LayoutParams(-1, dp(48)));
+        addParagraph(form, "平日為週一至週五，週末為週六、週日，可逐日調整；不自動套用國定假日。未勾選的日子不提醒，仍可隨時按下手動回報。", 13);
         addParagraph(form, "回報與提醒間隔", 16);
         final int[] options = {30, 60, 120, 180, 240};
         String[] labels = {"每 30 分鐘", "每 1 小時", "每 2 小時", "每 3 小時", "每 4 小時"};
@@ -860,8 +806,8 @@ public final class MainActivity extends Activity {
         placement.addView(bottom);
         placement.check("BOTTOM".equals(CheckInPreferences.getPlacement(this)) ? bottom.getId() : top.getId());
         form.addView(placement);
-        addParagraph(form, "切到 LINE、IG、FB 或鎖定螢幕後，改用系統通知提醒；是否彈出上方橫幅、發聲或震動，由手機通知設定決定。", 13);
-        addParagraph(form, "自動回報開啟時，每個間隔有使用 LINE、IG、FB 任一項，就嘗試回報一次；都沒有使用，才提醒手動回報。尚未開啟自動回報時，以手動提醒為主。成功回報後重新計時，省電或休眠可能延後執行。", 13);
+        addParagraph(form, "App 開啟時顯示畫面提醒，切到其他 App 或鎖定螢幕後用系統通知提醒；是否彈出橫幅、發聲或震動，由手機通知設定決定。", 13);
+        addParagraph(form, "提醒只會邀請你手動回報，不會取用位置。每次成功回報後重新計時，手機省電或休眠可能延後通知。", 13);
         addParagraph(form, "設定只套用在這支手機。家人可各自選擇頻率；回報位置前需登入並加入家庭。", 13);
         if (!CheckInScheduler.canShowNotifications(this)) {
             addParagraph(form, "手機目前未允許此類通知。請允許通知後，才能在 App 關閉時收到提醒。", 13);
@@ -876,9 +822,17 @@ public final class MainActivity extends Activity {
                 CheckInScheduler.getNotificationSettingsIntent(this)));
         ScrollView scroll = new ScrollView(this);
         scroll.addView(form);
-        new AlertDialog.Builder(this).setTitle("回報時間與提醒").setView(scroll)
+        AlertDialog settings = new AlertDialog.Builder(this).setTitle("回報時間與提醒").setView(scroll)
                 .setNegativeButton("取消", null)
-                .setPositiveButton("儲存", (dialog, which) -> {
+                .setPositiveButton("儲存", null).create();
+        settings.setOnShowListener(ignored -> settings.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(view -> {
+                    int selectedMask = 0;
+                    for (int d = 0; d < days.length; d++) if (days[d].isChecked()) selectedMask |= 1 << d;
+                    if (selectedMask == 0) {
+                        toast("請至少勾選一天；如不需提醒，可關閉定時提醒。");
+                        return;
+                    }
+                    CheckInPreferences.setReportDaysMask(this, selectedMask);
                     CheckInPreferences.setIntervalMinutes(this, options[interval.getSelectedItemPosition()]);
                     CheckInPreferences.setPlacement(this, placement.getCheckedRadioButtonId() == bottom.getId()
                             ? "BOTTOM" : "TOP");
@@ -888,9 +842,12 @@ public final class MainActivity extends Activity {
                     if (enabled.isChecked() && Build.VERSION.SDK_INT >= 33
                             && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
                         requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, REMINDER_NOTIFICATION_PERMISSION);
-                    } else toast(enabled.isChecked() ? "已儲存回報間隔與提醒。" : "已儲存間隔，定時提醒目前關閉。");
+                    } else toast(enabled.isChecked() ? "已儲存提醒日與間隔。" : "已儲存提醒日，定時提醒目前關閉。");
+                    dismissReminderBanner();
                     renderSharingCard();
-                }).show();
+                    settings.dismiss();
+                }));
+        settings.show();
     }
 
     private void showReminderBanner() {
@@ -898,7 +855,7 @@ public final class MainActivity extends Activity {
     }
 
     private void showReminderBanner(String reason) {
-        if (!resumed || destroyed) return;
+        if (!resumed || destroyed || !CheckInScheduler.isReminderDay(this)) return;
         dismissReminderBanner();
         CheckInScheduler.dismissNotification(this);
         reminderBanner = new FrameLayout(this);
@@ -921,9 +878,12 @@ public final class MainActivity extends Activity {
         FrameLayout.LayoutParams layout = new FrameLayout.LayoutParams(-1, -2, gravity);
         layout.setMargins(dp(14), dp(14), dp(14), dp(14));
         root.addView(reminderBanner, layout);
+        long now = System.currentTimeMillis();
+        main.postDelayed(expireReminderBanner, Math.max(1L, ReportWeekdays.nextMidnightAt(now) - now));
     }
 
     private void dismissReminderBanner() {
+        main.removeCallbacks(expireReminderBanner);
         if (reminderBanner == null) return;
         discardActions(reminderBanner);
         root.removeView(reminderBanner);
@@ -945,7 +905,7 @@ public final class MainActivity extends Activity {
             return;
         }
         new AlertDialog.Builder(this).setTitle("回報目前位置？")
-                .setMessage("這次回報會把你的目前位置提供給同一家庭的成員，並同步到家庭試算表保留歷史。你可以隨時停止新回報。這個按鈕只回報一次。")
+                .setMessage("確認後才取得一次目前位置，提供給同一家庭的成員。雲端只保留最新位置，不再匯出位置歷史；你可以隨時停止分享或刪除自己的位置資料。")
                 .setNegativeButton("取消", null)
                 .setPositiveButton("同意並回報", (dialog, which) -> {
                     if (hasLocationPermission()) requestManualPosition();
@@ -959,11 +919,13 @@ public final class MainActivity extends Activity {
 
     private void requestManualPosition() {
         if (!resumed || busy || manualLocation != null) return;
-        if (!LocationSharingService.isLocationEnabled(this)) {
-            showLocationSettings(false);
+        if (!isLocationEnabled()) {
+            showLocationSettings();
             return;
         }
         final int operation = ++manualReportEpoch;
+        final String reportingFamily = familyId(latestStatus);
+        final String reportingUser = api.currentUserId();
         runTask("正在準備這次位置回報…", () -> { api.setSharing(true); return true; }, ignored -> {
             if (!resumed || operation != manualReportEpoch) return;
             stopNeedsSync = false;
@@ -980,12 +942,11 @@ public final class MainActivity extends Activity {
                     renderSharingCard();
                     android.os.BatteryManager battery = (android.os.BatteryManager) getSystemService(BATTERY_SERVICE);
                     int level = battery == null ? -1 : battery.getIntProperty(android.os.BatteryManager.BATTERY_PROPERTY_CAPACITY);
-                    final String reportingUser = api.currentUserId();
                     runTask("正在回報位置…", () -> {
                         if (destroyed || operation != manualReportEpoch || !reportingUser.equals(api.currentUserId()))
                             return false;
                         api.publishLocation(location.getLatitude(), location.getLongitude(), location.getAccuracy(), level,
-                                Instant.ofEpochMilli(location.getTime()).toString());
+                                Instant.ofEpochMilli(location.getTime()).toString(), reportingFamily);
                         if (!destroyed && operation == manualReportEpoch && reportingUser.equals(api.currentUserId())
                                 && ApiClient.isLocallyEnabled(getApplicationContext()))
                             CheckInPreferences.markReported(getApplicationContext(), System.currentTimeMillis());
@@ -1023,18 +984,16 @@ public final class MainActivity extends Activity {
         manualLocation = null;
     }
 
-    private void showLocationSettings(boolean automatic) {
+    private void showLocationSettings() {
         new AlertDialog.Builder(this).setTitle("手機定位目前關閉")
                 .setMessage("回報位置需要你在手機設定開啟定位。App 只在回報時取得一次位置，完成或取消就停止取用；不會替你切換手機原有的定位開關。")
                 .setNegativeButton("取消", null)
                 .setPositiveButton("前往定位設定", (dialog, which) -> {
-                    resumeAutoAfterSettings = automatic;
-                    resumeSingleReportAfterSettings = !automatic;
+                    resumeSingleReportAfterSettings = true;
                     try {
                         startActivityForResult(new Intent(android.provider.Settings.ACTION_LOCATION_SOURCE_SETTINGS),
                                 LOCATION_SETTINGS_REQUEST);
                     } catch (android.content.ActivityNotFoundException error) {
-                        resumeAutoAfterSettings = false;
                         resumeSingleReportAfterSettings = false;
                         toast("請從手機設定開啟定位，再回到 App 按回報。");
                     }
@@ -1044,18 +1003,14 @@ public final class MainActivity extends Activity {
     @Override protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
         if (requestCode != LOCATION_SETTINGS_REQUEST) return;
-        boolean requestAuto = resumeAutoAfterSettings;
         boolean requestSingle = resumeSingleReportAfterSettings;
-        resumeAutoAfterSettings = false;
         resumeSingleReportAfterSettings = false;
-        if (!LocationSharingService.isLocationEnabled(this)) {
+        if (!isLocationEnabled()) {
             toast("手機定位仍關閉，尚未取得或回報位置。");
             return;
         }
         // Activity results can precede onResume. Finish only the already-confirmed request there.
-        if (requestAuto) {
-            if (resumed) startSharing(); else startShareAfterResume = true;
-        } else if (requestSingle) {
+        if (requestSingle) {
             if (resumed) requestManualPosition(); else manualReportAfterResume = true;
         }
     }
@@ -1088,7 +1043,7 @@ public final class MainActivity extends Activity {
                 .setPositiveButton("停止分享並登出", (dialog, which) -> {
                     cancelManualLocation();
                     CalendarScheduler.clearForAccountChange(this);
-                    LocationSharingService.stop(this);
+                    LocationRevocation.stop(this);
                     stopNeedsSync = true;
                     renderSharingCard();
                     runTask("正在停止分享並登出…", () -> {
@@ -1454,6 +1409,7 @@ public final class MainActivity extends Activity {
         stopNeedsSync = api.hasPendingStopForCurrentAccount();
         IntentFilter reminderFilter = new IntentFilter(CheckInScheduler.ACTION_REMINDER_DUE);
         reminderFilter.addAction(CheckInScheduler.ACTION_REPORT_COMPLETED);
+        reminderFilter.addAction(CheckInScheduler.ACTION_REMINDER_SETTINGS_CHANGED);
         ContextCompat.registerReceiver(this, reminderReceiver, reminderFilter, ContextCompat.RECEIVER_NOT_EXPORTED);
         reminderReceiverRegistered = true;
         CheckInScheduler.setAppForeground(true);
@@ -1464,7 +1420,6 @@ public final class MainActivity extends Activity {
         main.removeCallbacks(poll);
         main.postDelayed(poll, REFRESH_MS);
         main.post(() -> {
-            if (startShareAfterResume) { startShareAfterResume = false; startSharing(); }
             if (manualReportAfterResume) { manualReportAfterResume = false; requestManualPosition(); }
             handleReportIntent();
         });

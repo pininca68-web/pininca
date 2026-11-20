@@ -12,6 +12,7 @@ public final class CheckInPreferences {
     private static final String FILE = "check_in_preferences";
     private static final String ENABLED = "enabled";
     private static final String INTERVAL = "interval_minutes";
+    private static final String REPORT_DAYS = "report_days_mask";
     private static final String PLACEMENT = "placement";
     private static final String LAST_REPORTED = "last_reported_at";
     private static final String NEXT_REMINDER = "next_reminder_at";
@@ -26,7 +27,9 @@ public final class CheckInPreferences {
 
     public static int getIntervalMinutes(Context context) {
         synchronized (LOCK) {
-            int value = prefs(context).getInt(INTERVAL, ReminderTiming.DEFAULT_INTERVAL_MINUTES);
+            int value;
+            try { value = prefs(context).getInt(INTERVAL, ReminderTiming.DEFAULT_INTERVAL_MINUTES); }
+            catch (ClassCastException ignored) { value = ReminderTiming.DEFAULT_INTERVAL_MINUTES; }
             return ReminderTiming.isSupportedInterval(value)
                     ? value : ReminderTiming.DEFAULT_INTERVAL_MINUTES;
         }
@@ -36,11 +39,41 @@ public final class CheckInPreferences {
         ReminderTiming.intervalMillis(minutes);
         synchronized (LOCK) {
             if (getIntervalMinutes(context) == minutes) return;
-            long due = needsCycle(context)
-                    ? ReportCyclePolicy.start(System.currentTimeMillis(), minutes) : 0;
+            long due = needsCycle(context) ? ReportWeekdays.nextAllowedAt(
+                    ReportCyclePolicy.start(System.currentTimeMillis(), minutes), getReportDaysMask(context)) : 0;
             prefs(context).edit().putInt(INTERVAL, minutes).putLong(NEXT_REMINDER, due).apply();
             CheckInScheduler.reschedule(context);
         }
+    }
+
+    public static int getReportDaysMask(Context context) {
+        synchronized (LOCK) {
+            int stored;
+            try { stored = prefs(context).getInt(REPORT_DAYS, ReportWeekdays.ALL); }
+            catch (ClassCastException ignored) { stored = 0; }
+            int mask = ReportWeekdays.sanitizeMask(stored);
+            if (stored != mask) prefs(context).edit().putInt(REPORT_DAYS, mask).apply();
+            return mask;
+        }
+    }
+
+    public static void setReportDaysMask(Context context, int mask) {
+        ReportWeekdays.requireMask(mask);
+        synchronized (LOCK) {
+            if (getReportDaysMask(context) == mask) return;
+            long due = needsCycle(context) ? ReportWeekdays.nextAllowedAt(
+                    ReportCyclePolicy.start(System.currentTimeMillis(), getIntervalMinutes(context)), mask) : 0;
+            prefs(context).edit().putInt(REPORT_DAYS, mask).putLong(NEXT_REMINDER, due)
+                    .putLong(SNOOZE_DUE, 0).putLong(LAST_NOTIFICATION, 0).apply();
+            CheckInScheduler.dismissNotification(context);
+            CheckInScheduler.reschedule(context);
+            context.getApplicationContext().sendBroadcast(new Intent(CheckInScheduler.ACTION_REMINDER_SETTINGS_CHANGED)
+                    .setPackage(context.getPackageName()));
+        }
+    }
+
+    public static String getReportDaysLabel(Context context) {
+        return ReportWeekdays.label(getReportDaysMask(context));
     }
 
     public static boolean isEnabled(Context context) {
@@ -52,11 +85,12 @@ public final class CheckInPreferences {
     public static void setEnabled(Context context, boolean enabled) {
         synchronized (LOCK) {
             SharedPreferences.Editor editor = prefs(context).edit().putBoolean(ENABLED, enabled);
-            if (enabled && !isEnabled(context) && !LocationSharingService.isRunning()) {
-                editor.putLong(NEXT_REMINDER, ReportCyclePolicy.start(System.currentTimeMillis(),
-                        getIntervalMinutes(context)));
+            if (enabled && !isEnabled(context)) {
+                editor.putLong(NEXT_REMINDER, ReportWeekdays.nextAllowedAt(
+                        ReportCyclePolicy.start(System.currentTimeMillis(), getIntervalMinutes(context)),
+                        getReportDaysMask(context)));
             } else if (!enabled) {
-                if (!LocationSharingService.isRunning()) editor.putLong(NEXT_REMINDER, 0);
+                editor.putLong(NEXT_REMINDER, 0);
                 editor.putLong(SNOOZE_DUE, 0);
             }
             editor.apply();
@@ -97,7 +131,7 @@ public final class CheckInPreferences {
         }
     }
 
-    /** Keep this phone's interval/placement, but never reuse another account's report clock. */
+    /** Keep this phone's interval/days/placement, but never reuse another account's report clock. */
     public static void clearForAccountChange(Context context) {
         synchronized (LOCK) {
             prefs(context).edit()
@@ -120,8 +154,9 @@ public final class CheckInPreferences {
             long acceptedAt = Math.min(reportedAt, now);
             // An out-of-order network completion must not move our success clock backwards.
             long latest = Math.max(getLastReportedAt(app), acceptedAt);
-            long due = needsCycle(app)
-                    ? ReportCyclePolicy.afterSuccess(latest, now, getIntervalMinutes(app)) : 0;
+            long due = needsCycle(app) ? ReportWeekdays.nextAllowedAt(
+                    ReportCyclePolicy.afterSuccess(latest, now, getIntervalMinutes(app)),
+                    getReportDaysMask(app)) : 0;
             prefs(app).edit().putLong(LAST_REPORTED, latest).putLong(NEXT_REMINDER, due)
                     .putLong(SNOOZE_DUE, 0).apply();
             CheckInScheduler.dismissNotification(app);
@@ -144,16 +179,7 @@ public final class CheckInPreferences {
     }
 
     static boolean needsCycle(Context context) {
-        return isEnabled(context) || LocationSharingService.isRunning();
-    }
-
-    /** Explicit automatic opt-in starts a whole new interval, never an immediate fix. */
-    static void startAutomaticCycle(Context context) {
-        synchronized (LOCK) {
-            prefs(context).edit().putLong(NEXT_REMINDER,
-                    ReportCyclePolicy.start(System.currentTimeMillis(), getIntervalMinutes(context))).commit();
-            CheckInScheduler.reschedule(context);
-        }
+        return isEnabled(context);
     }
 
     static long ensureCycle(Context context, long now) {
@@ -162,31 +188,28 @@ public final class CheckInPreferences {
                 prefs(context).edit().putLong(NEXT_REMINDER, 0).apply();
                 return 0;
             }
-            long due = ReportCyclePolicy.ensureDeadline(getNextReminderAt(context), now, getIntervalMinutes(context));
+            long due = ReportWeekdays.reminderDue(getNextReminderAt(context), now,
+                    getIntervalMinutes(context), getReportDaysMask(context));
             if (due != getNextReminderAt(context)) prefs(context).edit().putLong(NEXT_REMINDER, due).apply();
             return due;
         }
     }
 
-    /** The alarm and live service use the same durable compare-and-advance under LOCK. */
+    /** Claim once before delivering a manual reminder. An alarm never authorizes location. */
     static ReportCyclePolicy.Window claimDueWindow(Context context, long now) {
         synchronized (LOCK) {
             if (!needsCycle(context)) return null;
+            if (!ReportWeekdays.isSelectedDay(now, getReportDaysMask(context))) {
+                ensureCycle(context, now);
+                return null;
+            }
             ReportCyclePolicy.Window window = ReportCyclePolicy.claim(getNextReminderAt(context), now,
                     getIntervalMinutes(context));
             if (window == null) return null;
-            // A failed disk write never authorizes an automatic location attempt.
-            if (!prefs(context).edit().putLong(NEXT_REMINDER, window.nextDue).commit()) return null;
+            long next = ReportWeekdays.nextAllowedAt(window.nextDue, getReportDaysMask(context));
+            if (!prefs(context).edit().putLong(NEXT_REMINDER, next).commit()) return null;
             CheckInScheduler.reschedule(context);
             return window;
-        }
-    }
-
-    /** Interval changes or a simultaneous successful manual report invalidate old pending work. */
-    static boolean isClaimCurrent(Context context, ReportCyclePolicy.Window window) {
-        synchronized (LOCK) {
-            return needsCycle(context) && getIntervalMinutes(context) == window.intervalMinutes
-                    && getNextReminderAt(context) == window.nextDue;
         }
     }
 
@@ -202,6 +225,10 @@ public final class CheckInPreferences {
         synchronized (LOCK) {
             long due = getSnoozeDue(context);
             if (!isEnabled(context) || due <= 0 || now < due) return false;
+            if (!ReportWeekdays.isSelectedDay(now, getReportDaysMask(context))) {
+                setSnoozeDue(context, ReportWeekdays.nextAllowedAt(now, getReportDaysMask(context)));
+                return false;
+            }
             return prefs(context).edit().putLong(SNOOZE_DUE, 0).commit();
         }
     }

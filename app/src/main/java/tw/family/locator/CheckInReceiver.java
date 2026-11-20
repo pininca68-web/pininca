@@ -20,6 +20,7 @@ public final class CheckInReceiver extends BroadcastReceiver {
                 || Intent.ACTION_TIME_CHANGED.equals(action)
                 || Intent.ACTION_TIMEZONE_CHANGED.equals(action)) {
             CheckInScheduler.reschedule(context);
+            LocationRevocation.schedule(context);
         }
     }
 }
